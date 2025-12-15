@@ -1,10 +1,8 @@
 /**
  * @file symbol_resolver.h
- * @brief System Abstraction Layer (SYMBOL_RESOLVER) Interface
- * * Provides a standardized interface for accessing Android system libraries
- * (libc, liblog, libselinux) dynamically at runtime. This ensures binary 
- * portability across different Android versions without linking against 
- * specific shared object versions at build time.
+ * @brief System Abstraction Layer (Interface).
+ * * Provides function pointers to Android system libraries (libc, liblog, libselinux).
+ * This allows the binary to run without build-time linking to unstable Android ABIs.
  */
 
 #ifndef SYMBOL_RESOLVER_H
@@ -15,7 +13,7 @@
 #include <stdarg.h>
 
 // ==============================================================================================
-// SECTION: Function Pointer Definitions
+// FUNCTION POINTER TYPES
 // ==============================================================================================
 
 // --- Android Logging (liblog) ---
@@ -32,11 +30,10 @@ typedef int (*func_setresgid)(gid_t rgid, gid_t egid, gid_t sgid);
 typedef int (*func_prctl)(int option, ...);
 
 // --- System Properties (libc) ---
-// __system_property_get is part of Bionic libc
 typedef int (*func_system_property_get)(const char* name, char* value);
 
 // ==============================================================================================
-// SECTION: API Structure
+// API STRUCTURE
 // ==============================================================================================
 
 /**
@@ -44,26 +41,20 @@ typedef int (*func_system_property_get)(const char* name, char* value);
  * Populated during initialization via dlopen/dlsym.
  */
 typedef struct {
-    // --- Library Handles ---
+    // Library Handles (Opaque)
     void* handle_libc;
     void* handle_liblog;
     void* handle_libselinux;
 
-    // --- Logging ---
-    func_android_log_print log_print;
-
-    // --- SELinux ---
-    func_setcon            selinux_setcon;
-    func_getcon            selinux_getcon;
-    func_freecon           selinux_freecon;
-    
-    // --- System / Process ---
-    func_setresuid         sys_setresuid;
-    func_setresgid         sys_setresgid;
-    func_prctl             sys_prctl;
-    
-    // --- Properties ---
-    func_system_property_get sys_prop_get;
+    // API Functions
+    func_android_log_print      log_print;
+    func_setcon                 selinux_setcon;
+    func_getcon                 selinux_getcon;
+    func_freecon                selinux_freecon;
+    func_setresuid              sys_setresuid;
+    func_setresgid              sys_setresgid;
+    func_prctl                  sys_prctl;
+    func_system_property_get    sys_prop_get;
 
 } SystemAPI;
 
@@ -71,31 +62,30 @@ typedef struct {
 extern const SystemAPI* g_api;
 
 // ==============================================================================================
-// SECTION: Lifecycle Functions
+// LIFECYCLE
 // ==============================================================================================
 
 /**
  * @brief Initializes the System Abstraction Layer.
- * Loads required shared libraries and resolves symbols.
- * @return 0 on success, non-zero on fatal error (logs to stderr).
+ * Loads libraries and resolves symbols.
+ * @return 0 on success, exit(1) on failure.
  */
 int symbol_resolver_init(void);
 
 /**
  * @brief Cleans up SYMBOL_RESOLVER resources.
- * Closes dlopen handles.
  */
 void symbol_resolver_cleanup(void);
 
 // ==============================================================================================
-// SECTION: Logging Macros
+// LOGGING MACROS
 // ==============================================================================================
 
-// Priority Constants for __android_log_print
 #define ANDROID_LOG_INFO  4
 #define ANDROID_LOG_ERROR 6
 #define ANDROID_LOG_FATAL 7
 
+// Safe logging macros that check for API existence before calling
 #define LOG_INFO(tag, ...)  if (g_api && g_api->log_print) g_api->log_print(ANDROID_LOG_INFO, tag, __VA_ARGS__)
 #define LOG_ERROR(tag, ...) if (g_api && g_api->log_print) g_api->log_print(ANDROID_LOG_ERROR, tag, __VA_ARGS__)
 #define LOG_FATAL(tag, ...) if (g_api && g_api->log_print) g_api->log_print(ANDROID_LOG_FATAL, tag, __VA_ARGS__)

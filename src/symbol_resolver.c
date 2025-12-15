@@ -1,8 +1,8 @@
 /**
  * @file symbol_resolver.c
- * @brief System Abstraction Layer Implementation
- * * Implements the runtime loading of Android system libraries.
- * * Ensures all critical symbols are resolved before allowing the daemon to proceed.
+ * @brief System Abstraction Layer Implementation.
+ * * Handles the manual loading of Android shared libraries via dlopen/dlsym.
+ * Fails hard (exit) if critical system symbols are missing.
  */
 
 #include "symbol_resolver.h"
@@ -23,12 +23,12 @@ const SystemAPI* g_api = &internal_api;
  * Exits program on failure as these are critical dependencies.
  */
 static void* load_lib_or_die(const char* name) {
-    // Clear any existing error
-    dlerror();
+    dlerror(); // Clear error
     
     void* handle = dlopen(name, RTLD_NOW);
     if (!handle) {
-        // Use stderr because log system might not be ready
+        // Fallback to stderr. In Android this might be /dev/null, 
+        // but it's the best we can do before liblog is loaded.
         fprintf(stderr, "[SYMBOL_RESOLVER_FATAL] Failed to load library '%s': %s\n", name, dlerror());
         exit(EXIT_FAILURE);
     }
@@ -40,13 +40,11 @@ static void* load_lib_or_die(const char* name) {
  * Exits program on failure.
  */
 static void* load_sym_or_die(void* handle, const char* symbol) {
-    dlerror(); // Clear error state
+    dlerror(); 
     
     void* ptr = dlsym(handle, symbol);
     const char* error = dlerror();
     
-    // dlsym returns NULL if symbol is not found OR if symbol value is NULL.
-    // dlerror() returns non-NULL only if an error occurred.
     if (error != NULL) {
         fprintf(stderr, "[SYMBOL_RESOLVER_FATAL] Failed to resolve symbol '%s': %s\n", symbol, error);
         exit(EXIT_FAILURE);
@@ -95,6 +93,5 @@ void symbol_resolver_cleanup(void) {
     internal_api.handle_liblog     = NULL;
     internal_api.handle_libc       = NULL;
     
-    // We can still log here because the library remains loaded in the process space.
     LOG_INFO("HubCore", "System Abstraction Layer shutdown complete (Libraries preserved).");
 }
