@@ -1,11 +1,11 @@
 /**
- * @file sal.c
+ * @file symbol_resolver.c
  * @brief System Abstraction Layer Implementation
  * * Implements the runtime loading of Android system libraries.
  * * Ensures all critical symbols are resolved before allowing the daemon to proceed.
  */
 
-#include "sal.h"
+#include "symbol_resolver.h"
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +29,7 @@ static void* load_lib_or_die(const char* name) {
     void* handle = dlopen(name, RTLD_NOW);
     if (!handle) {
         // Use stderr because log system might not be ready
-        fprintf(stderr, "[SAL_FATAL] Failed to load library '%s': %s\n", name, dlerror());
+        fprintf(stderr, "[SYMBOL_RESOLVER_FATAL] Failed to load library '%s': %s\n", name, dlerror());
         exit(EXIT_FAILURE);
     }
     return handle;
@@ -48,7 +48,7 @@ static void* load_sym_or_die(void* handle, const char* symbol) {
     // dlsym returns NULL if symbol is not found OR if symbol value is NULL.
     // dlerror() returns non-NULL only if an error occurred.
     if (error != NULL) {
-        fprintf(stderr, "[SAL_FATAL] Failed to resolve symbol '%s': %s\n", symbol, error);
+        fprintf(stderr, "[SYMBOL_RESOLVER_FATAL] Failed to resolve symbol '%s': %s\n", symbol, error);
         exit(EXIT_FAILURE);
     }
     return ptr;
@@ -58,7 +58,7 @@ static void* load_sym_or_die(void* handle, const char* symbol) {
 // SECTION: Public API
 // ==============================================================================================
 
-int sal_init(void) {
+int symbol_resolver_init(void) {
     // 1. Load Libraries
     // Note: Library names may vary slightly by Android version.
     internal_api.handle_libc       = load_lib_or_die("libc.so");
@@ -86,7 +86,7 @@ int sal_init(void) {
     return 0;
 }
 
-void sal_cleanup(void) {
+void symbol_resolver_cleanup(void) {
     // Safety: Do NOT close libc, liblog, or libselinux.
     // Unloading core system libraries while the process is running is undefined behavior 
     

@@ -1,14 +1,14 @@
 /**
- * @file sal.h
- * @brief System Abstraction Layer (SAL) Interface
+ * @file symbol_resolver.h
+ * @brief System Abstraction Layer (SYMBOL_RESOLVER) Interface
  * * Provides a standardized interface for accessing Android system libraries
  * (libc, liblog, libselinux) dynamically at runtime. This ensures binary 
  * portability across different Android versions without linking against 
  * specific shared object versions at build time.
  */
 
-#ifndef SAL_H
-#define SAL_H
+#ifndef SYMBOL_RESOLVER_H
+#define SYMBOL_RESOLVER_H
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -79,13 +79,13 @@ extern const SystemAPI* g_api;
  * Loads required shared libraries and resolves symbols.
  * @return 0 on success, non-zero on fatal error (logs to stderr).
  */
-int sal_init(void);
+int symbol_resolver_init(void);
 
 /**
- * @brief Cleans up SAL resources.
+ * @brief Cleans up SYMBOL_RESOLVER resources.
  * Closes dlopen handles.
  */
-void sal_cleanup(void);
+void symbol_resolver_cleanup(void);
 
 // ==============================================================================================
 // SECTION: Logging Macros
@@ -100,4 +100,4 @@ void sal_cleanup(void);
 #define LOG_ERROR(tag, ...) if (g_api && g_api->log_print) g_api->log_print(ANDROID_LOG_ERROR, tag, __VA_ARGS__)
 #define LOG_FATAL(tag, ...) if (g_api && g_api->log_print) g_api->log_print(ANDROID_LOG_FATAL, tag, __VA_ARGS__)
 
-#endif // SAL_H
+#endif // SYMBOL_RESOLVER_H
