@@ -1,33 +1,51 @@
-#ifndef SYMBOL_RESOLVER_H
-#define SYMBOL_RESOLVER_H
+/**
+ * @file symbol_resolver.h
+ * @brief System Abstraction Layer (SAL).
+ *
+ * Provides wrappers for Android system libraries (liblog, libcutils, libselinux)
+ * loaded dynamically at runtime via dlopen/dlsym. This removes build-time 
+ * dependencies on the Android NDK specifics.
+ */
 
-#include <sys/types.h>
-#include <unistd.h>
+#ifndef PROJECT_HUB_SAL_H
+#define PROJECT_HUB_SAL_H
 
-/* Function Pointers for Runtime Loading */
-typedef int  (*f_log_print)(int prio, const char* tag, const char* fmt, ...);
-typedef int  (*f_setcon)(const char *ctx);
-typedef int  (*f_setresuid)(uid_t r, uid_t e, uid_t s);
-typedef int  (*f_setresgid)(gid_t r, gid_t e, gid_t s);
-typedef int  (*f_prctl)(int opt, ...);
-typedef int  (*f_prop_get)(const char* key, char* val);
+// --- Function Pointer Definitions ---
+typedef int (*pfn_android_log_print)(int prio, const char* tag, const char* fmt, ...);
+typedef int (*pfn_system_property_get)(const char* key, char* value);
+typedef int (*pfn_setcon)(const char* context);
 
+// --- Context ---
 typedef struct {
-    f_log_print  log;
-    f_setcon     setcon;
-    f_setresuid  setresuid;
-    f_setresgid  setresgid;
-    f_prctl      prctl;
-    f_prop_get   prop_get;
-} sys_api_t;
+    void* handle_liblog;
+    void* handle_libc;
+    void* handle_libselinux;
 
-extern const sys_api_t* sys;
+    pfn_android_log_print   log_print;
+    pfn_system_property_get prop_get;
+    pfn_setcon              set_con;
+    
+    int initialized;
+} SalContext;
 
-int  sal_init(void);
+// --- Lifecycle ---
+/**
+ * @brief Initialize the HAL, load libraries and resolve symbols.
+ * @return 0 on success.
+ */
+int sal_init(void);
+
+/**
+ * @brief Close library handles.
+ */
 void sal_cleanup(void);
 
-#define LOG_I(tag, ...) if (sys && sys->log) sys->log(4, tag, __VA_ARGS__)
-#define LOG_E(tag, ...) if (sys && sys->log) sys->log(6, tag, __VA_ARGS__)
-#define LOG_F(tag, ...) if (sys && sys->log) sys->log(7, tag, __VA_ARGS__)
+// --- Wrappers ---
+void sal_log_info(const char* fmt, ...);
+void sal_log_error(const char* fmt, ...);
+int sal_get_property(const char* key, char* value);
+int sal_set_selinux_context(const char* context);
 
-#endif
+#endif // PROJECT_HUB_SAL_H
+
+
