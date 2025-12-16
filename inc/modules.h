@@ -1,31 +1,37 @@
-#ifndef MODULES_H
-#define MODULES_H
+/**
+ * @file modules.h
+ * @brief Registry and definitions for isolated task modules.
+ */
 
-#include <stdint.h>
-#include <sys/types.h>
+#ifndef PROJECT_HUB_MODULES_H
+#define PROJECT_HUB_MODULES_H
 
-typedef enum {
-    MOD_IMEI = 0,
-    MOD_PHONE,
-    MOD_NET,
-    MOD_COUNT
-} mod_id_t;
+// --- Module IDs ---
+#define MOD_ID_IMEI     0
+#define MOD_ID_PHONE    1
+#define MOD_ID_MAC      2
+#define MOD_ID_LOGGER   3
+#define MOD_ID_SENDER   4
 
-typedef enum {
-    TYPE_ONESHOT,
-    TYPE_SERVICE
-} mod_type_t;
+/**
+ * @brief Standard function signature for all modules.
+ * @param socket_fd Unix Domain Socket (Write-only for results).
+ * @param input_arg Optional input string from Orchestrator.
+ */
+typedef void (*module_entry_fn)(int socket_fd, const char* input_arg);
 
-typedef struct {
-    mod_id_t    id;
-    const char* name;
-    mod_type_t  type;
-    uid_t       uid;
-    gid_t       gid;
-    const char* se_ctx;
-    void      (*run)(int fd);
-} mod_def_t;
+/**
+ * @brief Retrieve the entry point for a specific module ID.
+ */
+module_entry_fn get_module_entry(int module_id);
 
-extern const mod_def_t MODULES[MOD_COUNT];
+// --- Specific Implementations ---
+void mod_imei_entry(int socket_fd, const char* input_arg);
+void mod_phone_entry(int socket_fd, const char* input_arg);
+void mod_mac_entry(int socket_fd, const char* input_arg);
+void mod_logger_entry(int socket_fd, const char* input_arg);
+void mod_sender_entry(int socket_fd, const char* input_arg);
 
-#endif
+#endif // PROJECT_HUB_MODULES_H
+
+
